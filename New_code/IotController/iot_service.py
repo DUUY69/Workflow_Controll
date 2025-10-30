@@ -116,34 +116,59 @@ def _bytes_to_hex(data: bytes) -> str:
     return ' '.join(f"{b:02X}" for b in data)
 
 
-def process_command(iot: IoTSerial, devices: Dict[str, Dict[str, str]], defaults: Dict[str, Any], cmd: Dict[str, Any]) -> Dict[str, Any]:
+def _resolve_port_and_baud(cmd: Dict[str, Any], devices: Dict[str, Dict[str, str]], defaults: Dict[str, Any]) -> tuple[str | None, int]:
+    """Resolve target serial port and baudrate from command and devices map."""
+    port = cmd.get('port')
+    baud = cmd.get('baud')
+    device = cmd.get('device')
+    if device and not port:
+        info = devices.get(str(device), {})
+        port = info.get('com')
+        baud = baud or info.get('baud')
+    if not port:
+        return None, int(defaults.get('DEFAULT_BAUDRATE', 115200))
+    baudrate = int(baud or defaults.get('DEFAULT_BAUDRATE', 115200))
+    return str(port), baudrate
+
+
+def process_command(iot_pool: Dict[str, IoTSerial], devices: Dict[str, Dict[str, str]], defaults: Dict[str, Any], cmd: Dict[str, Any]) -> Dict[str, Any]:
     result: Dict[str, Any] = { 'id': cmd.get('id'), 'ok': False }
     type_raw = cmd.get('type') if cmd.get('type') is not None else cmd.get('command', '')
     type_ = str(type_raw).strip().lower()
 
     if type_ == 'connect':
-        # { command: 'connect', device: 'MyDevice' } or { port: 'COM7', baud: 115200 }
-        port = cmd.get('port')
-        baud = cmd.get('baud')
-        device = cmd.get('device')
-        if device and not port:
-            info = devices.get(str(device), {})
-            port = info.get('com')
-            baud = baud or info.get('baud')
+        # Supports multi-device: { command: 'connect', device: 'IceMake' } or { port: 'COM7', baud: 115200 }
+        port, baudrate = _resolve_port_and_baud(cmd, devices, defaults)
         if not port:
             result['message'] = 'Missing port/device'
             return result
-        baudrate = int(baud or defaults.get('DEFAULT_BAUDRATE', 115200))
         timeout = float(defaults.get('DEFAULT_TIMEOUT', 1.0))
-        ok = iot.open(port=str(port), baudrate=baudrate, timeout=timeout)
+        key = str(cmd.get('device') or port)
+        if key not in iot_pool:
+            iot_pool[key] = IoTSerial()
+        ok = iot_pool[key].open(port=str(port), baudrate=baudrate, timeout=timeout)
         result['ok'] = bool(ok)
         result['message'] = 'connected' if ok else 'failed'
         return result
 
     if type_ == 'disconnect':
-        iot.close()
-        result['ok'] = True
-        result['message'] = 'disconnected'
+        # Target a specific device/port; if none provided, disconnect all
+        target_key = str(cmd.get('device') or cmd.get('port') or '')
+        if target_key:
+            i = iot_pool.get(target_key)
+            if i:
+                i.close()
+                del iot_pool[target_key]
+            result['ok'] = True
+            result['message'] = 'disconnected'
+        else:
+            for key, i in list(iot_pool.items()):
+                try:
+                    i.close()
+                finally:
+                    del iot_pool[key]
+            result['ok'] = True
+            result['message'] = 'disconnected_all'
         return result
 
     if type_ == 'send_hex':
@@ -151,6 +176,23 @@ def process_command(iot: IoTSerial, devices: Dict[str, Dict[str, str]], defaults
         if not hex_string:
             result['message'] = 'Missing hex'
             return result
+        # Route to specific device/port; auto-connect if not present but resolvable
+        target_key = str(cmd.get('device') or cmd.get('port') or '')
+        if not target_key:
+            result['message'] = 'Missing device/port'
+            return result
+        iot = iot_pool.get(target_key)
+        if not iot or not iot.is_open():
+            port, baudrate = _resolve_port_and_baud(cmd, devices, defaults)
+            if not port:
+                result['message'] = 'Missing port/device'
+                return result
+            iot = iot or IoTSerial()
+            ok_open = iot.open(port=port, baudrate=baudrate, timeout=float(defaults.get('DEFAULT_TIMEOUT', 1.0)))
+            if not ok_open:
+                result['message'] = 'failed'
+                return result
+            iot_pool[target_key] = iot
         # Optional: flush any pending input before sending
         if cmd.get('flush', False) and iot.is_open():
             try:
@@ -202,7 +244,8 @@ def main() -> None:
     ensure_dirs(out_dir)
 
     devices = parse_devices_from_config_env(env_path)
-    iot = IoTSerial()
+    # Multi-device connection pool: key by device name or port string
+    iot_pool: Dict[str, IoTSerial] = {}
     print('iot_ready')
 
     while True:
@@ -221,7 +264,7 @@ def main() -> None:
             except Exception:
                 resp = { 'ok': False, 'message': 'invalid_json' }
             else:
-                resp = process_command(iot, devices, env, cmd)
+                resp = process_command(iot_pool, devices, env, cmd)
             out_name = os.path.splitext(name)[0] + '.response.json'
             with open(os.path.join(out_dir, out_name), 'w', encoding='utf-8') as f:
                 json.dump(resp, f, ensure_ascii=False)
