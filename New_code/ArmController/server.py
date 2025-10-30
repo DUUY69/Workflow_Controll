@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -77,6 +77,34 @@ async def handle_command(action: str = Form(...), file: Optional[str] = Form(Non
 			})
 	else:
 		raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
+
+
+# JSON-compatible endpoint matching file-based format
+@app.post("/command_json")
+async def command_json(req: Request):
+    try:
+        payload = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_json")
+    # Lazy import to avoid circular at module import time
+    from . import arm_controller as ac  # type: ignore
+    # Initialize robot once
+    global _robot_client, _arm_env
+    if '_robot_client' not in globals():
+        cfg_path = os.path.join(os.path.dirname(__file__), '.env_arm_config')
+        _arm_env = ac._load_env_file(cfg_path)
+        _arm_env.setdefault('ROBOT_IP', '192.168.58.2')
+        _arm_env.setdefault('XMLRPC_PORT', '20003')
+        _arm_env.setdefault('TCP_UPLOAD_PORT', '20010')
+        _robot_client = ac.RobotClient(
+            ip=_arm_env.get('ROBOT_IP', '192.168.58.2'),
+            xmlrpc_port=int(_arm_env.get('XMLRPC_PORT', '20003')),
+            tcp_port=int(_arm_env.get('TCP_UPLOAD_PORT', '20010')),
+        )
+        _robot_client.connect()
+    resp = ac.process_command(_robot_client, payload)
+    # Normalize to { id, ok, message, ... }
+    return JSONResponse(resp)
 
 
 @app.post("/upload/lua")

@@ -1,5 +1,7 @@
 import os
 import json
+import urllib.request
+import urllib.error
 import time
 import uuid
 from typing import Any, Dict, List
@@ -50,6 +52,17 @@ def wait_for_response(out_dir: str, base_name: str, timeout_s: float) -> Dict[st
     return None
 
 
+def _http_post_json(url: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any] | None:
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode('utf-8')
+            return json.loads(text)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
 def dispatch_step(env: Dict[str, str], wf_id: str, step: Dict[str, Any]) -> Dict[str, Any]:
     system = str(step.get('system', '')).strip().lower()
     request: Dict[str, Any] = dict(step.get('request') or {})
@@ -60,14 +73,28 @@ def dispatch_step(env: Dict[str, str], wf_id: str, step: Dict[str, Any]) -> Dict
     if 'id' not in request:
         request['id'] = f"{wf_id}:{step_id}"
 
+    use_http = str(env.get('USE_HTTP', '0')).strip() in ('1', 'true', 'yes')
     if system == 'arm':
         inbox = os.path.abspath(env['ARM_INBOX'])
         outbox = os.path.abspath(env['ARM_OUTBOX'])
+        http_url = env.get('ARM_HTTP')
     elif system == 'iot':
         inbox = os.path.abspath(env['IOT_INBOX'])
         outbox = os.path.abspath(env['IOT_OUTBOX'])
+        http_url = env.get('IOT_HTTP')
     else:
         return { 'ok': False, 'message': f'unknown_system:{system}' }
+
+    # Prefer HTTP if enabled and URL present
+    if use_http and http_url:
+        # Choose endpoint
+        url = http_url.rstrip('/') + '/command_json'
+        resp = _http_post_json(url, request, timeout_s)
+        if resp is None:
+            # fallback to file
+            pass
+        else:
+            return resp
 
     base_name = f"wf_{wf_id}__{step_id}"
     in_path = os.path.join(inbox, base_name + '.json')
