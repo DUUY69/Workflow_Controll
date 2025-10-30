@@ -1,6 +1,6 @@
 @echo off
 REM Khoi dong ArmController tren port 8001
-start "ArmController" cmd /k "cd /d D:\2025\Arm-28-10\New_code\New_code\ArmController && python server.py"
+start "ArmController" cmd /k "cd /d D:\2025\Arm-28-10\New_code\New_code\ArmController && python arm_controller.py"
 timeout /t 2
 
 REM Khoi dong IotController mới (duy nhất, gộp hết vào iot_service.py)

@@ -2,9 +2,19 @@ import os
 import sys
 import json
 import time
+import threading
+from typing import Any, Dict, Optional
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+import uvicorn
 import socket
 import xmlrpc.client
-from typing import Any, Dict, Optional
+import hashlib
+from pathlib import Path
+from fastapi import UploadFile, File, Form
+import subprocess
+import shutil
+from contextlib import asynccontextmanager
 
 
 def _load_env_file(env_path: str) -> Dict[str, str]:
@@ -29,49 +39,35 @@ class RobotClient:
 		self.robot = None  # SDK RPC object or xmlrpc ServerProxy
 
 	def connect(self):
-		# Try local fairino_sdk first
+		print(f"[LOG] Bắt đầu kết nối tới robot tại IP {self.ip} (SDK/XMLRPC Port: {self.xmlrpc_port})")
 		robot = None
 		try:
-			import sys
-			sdk_path = os.path.join(os.path.dirname(__file__), 'fairino_sdk')
-			if sdk_path not in sys.path:
-				sys.path.insert(0, sdk_path)
-			from fairino import Robot  # type: ignore
+			from fairino import Robot
+			robot = Robot.RPC(self.ip)
+			print(f"[LOG] Kết nối bằng fairino SDK (Robot.RPC) thành công.")
+		except Exception as e:
+			print(f"[LOG] Kết nối Robot.RPC thất bại: {e}. Fallback sang XML-RPC...")
 			try:
-				robot = Robot.RPC(self.ip)
-			except Exception:
-				robot = None
-		except Exception:
-			robot = None
-
-		# Fallback to local fairino
-		if robot is None:
-			try:
-				from fairino import Robot as LocalRobot  # type: ignore
-				try:
-					robot = LocalRobot.RPC(self.ip)
-				except Exception:
-					robot = None
-			except Exception:
-				robot = None
-
-		# Fallback to raw XML-RPC
-		if robot is None:
-			paths = ["/RPC2", "/RPC", "/"]
-			for path in paths:
-				url = f"http://{self.ip}:{self.xmlrpc_port}{path}"
-				try:
-					proxy = xmlrpc.client.ServerProxy(url)
-					# health check
+				paths = ["/RPC2", "/RPC", "/"]
+				for path in paths:
+					url = f"http://{self.ip}:{self.xmlrpc_port}{path}"
 					try:
-						_ = proxy.GetControllerIP()
-					except Exception:
-						_ = proxy.GetLuaList()
-					robot = proxy
-					break
-				except Exception:
-					continue
-
+						proxy = xmlrpc.client.ServerProxy(url)
+						try:
+							_ = proxy.GetControllerIP()
+						except Exception:
+							_ = proxy.GetLuaList()
+						print(f"[LOG] Kết nối XML-RPC thành công tại URL {url}")
+						robot = proxy
+						break
+					except Exception as e2:
+						print(f"[LOG] Kết nối XML-RPC thất bại tại {url}: {e2}")
+			except Exception as e3:
+				print(f"[LOG] Kết nối XML-RPC thất bại hoàn toàn: {e3}")
+		if robot is not None:
+			print(f"[LOG] Kết nối tới robot thành công!")
+		else:
+			print(f"[LOG] Kết nối tới robot thất bại!")
 		self.robot = robot
 		return self.robot is not None
 
@@ -84,7 +80,7 @@ class RobotClient:
 			return func(*args)
 		raise AttributeError(name)
 
-	def run_lua_and_wait(self, lua_filename: str, timeout: float = 8.0) -> bool:
+	def run_lua_and_wait(self, lua_filename: str, timeout: float = 0) -> bool:
 		if self.robot is None:
 			print(f"[DEBUG] Robot is None")
 			return False
@@ -109,9 +105,16 @@ class RobotClient:
 
 	def _wait_complete(self, timeout: float) -> bool:
 		start = time.time()
-		while time.time() - start < timeout:
+		wait_forever = timeout <= 0
+
+		while True:
+			# Check for timeout only if it's not an indefinite wait
+			if not wait_forever and (time.time() - start > timeout):
+				print(f"[DEBUG] Timeout after {timeout}s, treating as completed")
+				return True  # Keep original behavior: timeout is considered success
+
 			try:
-				# Method 1: CheckCommandFinish (from old code)
+				# Method 1: CheckCommandFinish
 				if callable(getattr(self.robot, 'CheckCommandFinish', None)):
 					try:
 						result = self._call('CheckCommandFinish')
@@ -126,53 +129,54 @@ class RobotClient:
 					except Exception as e:
 						print(f"[DEBUG] CheckCommandFinish error: {e}")
 				
-				# Method 2: GetRobotMotionState (from old code)
+				# Method 2: GetRobotMotionState
 				if callable(getattr(self.robot, 'GetRobotMotionState', None)):
 					try:
 						result = self._call('GetRobotMotionState')
 						print(f"[DEBUG] Motion State: {result}")
-						# Motion state == 0 usually means idle/completed
 						if int(result) == 0:
 							print(f"[DEBUG] GetRobotMotionState: completed")
 							return True
 					except Exception as e:
 						print(f"[DEBUG] GetRobotMotionState error: {e}")
 				
-				# Method 3: GetProgramState
+				# Method 3: GetProgramState (FIXED for list responses)
 				if callable(getattr(self.robot, 'GetProgramState', None)):
-					res = self._call('GetProgramState')
-					if isinstance(res, tuple):
-						if len(res) >= 2 and int(res[0]) == 0 and int(res[1]) == 0:
+					try:
+						res = self._call('GetProgramState')
+						# Handle both tuple and list for completion state [0, 0]
+						if isinstance(res, (tuple, list)):
+							if len(res) >= 2 and int(res[0]) == 0 and int(res[1]) == 0:
+								print(f"[DEBUG] GetProgramState: completed")
+								return True
+						# Handle single integer value for completion state 0
+						elif int(res) == 0:
 							print(f"[DEBUG] GetProgramState: completed")
 							return True
-					else:
-						if int(res) == 0:
-							print(f"[DEBUG] GetProgramState: completed")
-							return True
+					except Exception as e:
+						print(f"[DEBUG] GetProgramState error: {e}")
+
+				# Alternative names for program state check
+				for alt in ('ProgramState', 'GetProgramRunState', 'IsProgramRunning'):
+					try:
+						fn = getattr(self.robot, alt, None)
+						if callable(fn):
+							val = fn()
+							if isinstance(val, (tuple, list)):
+								err = int(val[0])
+								state = int(val[1]) if len(val) > 1 and val[1] is not None else 0
+								if err == 0 and state == 0:
+									print(f"[DEBUG] {alt}: completed")
+									return True
+							elif val in (0, False, None):
+								print(f"[DEBUG] {alt}: completed")
+								return True
+					except Exception:
+						pass
 			except Exception as e:
-				print(f"[DEBUG] GetProgramState error: {e}")
-			# Alternative names
-			for alt in ('ProgramState', 'GetProgramRunState', 'IsProgramRunning'):
-				try:
-					fn = getattr(self.robot, alt, None)
-					if callable(fn):
-						val = fn()
-						if isinstance(val, tuple):
-							err = int(val[0])
-							state = int(val[1]) if len(val) > 1 and val[1] is not None else 0
-							if err == 0 and state == 0:
-								print(f"[DEBUG] {alt}: completed")
-								return True
-						else:
-							if val in (0, False, None):
-								print(f"[DEBUG] {alt}: completed")
-								return True
-				except Exception:
-					pass
-			time.sleep(0.1)  # Faster polling like old code
-		# If no API available (e.g., raw xmlrpc proxy without methods), treat timeout as done
-		print(f"[DEBUG] Timeout after {timeout}s, treating as completed")
-		return True  # Changed from False to True - assume completed if no API
+				print(f"[DEBUG] Error in waiting loop: {e}")
+			
+			time.sleep(0.1)
 
 	def upload_lua(self, path: str) -> bool:
 		if self.robot is None:
@@ -192,7 +196,6 @@ class RobotClient:
 				data = f.read()
 			file_size = len(data)
 			total_size = file_size + 4 + 46
-			import hashlib
 			md5 = hashlib.md5(data).hexdigest()
 			head = f"/f/b{total_size:10d}{md5}".encode(errors='replace')
 			end = b"/b/f"
@@ -232,7 +235,6 @@ class RobotClient:
 					_ = self._call('FileUpload', filename)
 				with open(path, 'rb') as f:
 					data = f.read()
-				import hashlib
 				md5 = hashlib.md5(data).hexdigest()
 				total_size = len(data) + 4 + 46
 				head = f"/f/b{total_size:10d}{md5}".encode(errors='replace')
@@ -289,7 +291,6 @@ class RobotClient:
 						_ = self._call('FileUpload', filename)
 					with open(path, 'rb') as f:
 						data = f.read()
-					import hashlib
 					md5 = hashlib.md5(data).hexdigest()
 					total_size = len(data) + 4 + 46
 					head = f"/f/b{total_size:10d}{md5}".encode(errors='replace')
@@ -340,7 +341,6 @@ class RobotClient:
 					_ = self._call('FileUpload', filename)
 				with open(path, 'rb') as f:
 					data = f.read()
-				import hashlib
 				md5 = hashlib.md5(data).hexdigest()
 				total_size = len(data) + 4 + 46
 				head = f"/f/b{total_size:10d}{md5}".encode(errors='replace')
@@ -428,10 +428,11 @@ def process_command(robot: RobotClient, cmd: Dict[str, Any]) -> Dict[str, Any]:
 	result: Dict[str, Any] = { 'id': cmd_id, 'ok': False }
 	if type_ == 'run_lua':
 		file_ = cmd.get('file')
+		timeout = float(cmd.get('timeout', 0))  # Default to 0 (wait forever)
 		if not file_:
 			result['message'] = 'Missing file'
 			return result
-		ok = robot.run_lua_and_wait(file_)
+		ok = robot.run_lua_and_wait(file_, timeout)
 		result['ok'] = bool(ok)
 		result['message'] = 'completed' if ok else 'failed'
 		return result
@@ -466,63 +467,190 @@ def process_command(robot: RobotClient, cmd: Dict[str, Any]) -> Dict[str, Any]:
 		return result
 
 
-def main():
-	cfg_path = os.path.join(os.path.dirname(__file__), '.env_arm_config')
-	cfg = _load_env_file(cfg_path)
-	# defaults
-	cfg.setdefault('ROBOT_IP', '192.168.58.2')
-	cfg.setdefault('XMLRPC_PORT', '20003')
-	cfg.setdefault('TCP_UPLOAD_PORT', '20010')
-	cfg.setdefault('INPUT_DIR', './inbox')
-	cfg.setdefault('OUTPUT_DIR', './outbox')
+# ========== PATCH POOL ARM ==========
+app = FastAPI(title="ArmController Combo")
+_SHARED_POOL = None
+_SHARED_CFG = None
+_inbox_path = None
+_outbox_path = None
+_robot_client = None
 
-	in_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), cfg.get('INPUT_DIR', './inbox')))
-	out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), cfg.get('OUTPUT_DIR', './outbox')))
-	ensure_dirs(in_dir)
-	ensure_dirs(out_dir)
+# Khởi tạo toàn bộ config/pool ở STARTUP!!!
+def on_startup_sync():
+    global _SHARED_POOL, _SHARED_CFG, _robot_client, _inbox_path, _outbox_path
+    base = os.path.dirname(__file__)
+    cfg_path = os.path.join(base, '.env_arm_config')
+    _SHARED_CFG = _load_env_file(cfg_path)
+    _SHARED_CFG.setdefault('ROBOT_IP', '192.168.58.2')
+    _SHARED_CFG.setdefault('XMLRPC_PORT', '20003')
+    _SHARED_CFG.setdefault('TCP_UPLOAD_PORT', '20010')
+    _SHARED_CFG.setdefault('INPUT_DIR', './inbox')
+    _SHARED_CFG.setdefault('OUTPUT_DIR', './outbox')
+    _inbox_path = os.path.abspath(os.path.join(base, _SHARED_CFG.get('INPUT_DIR', './inbox')))
+    _outbox_path = os.path.abspath(os.path.join(base, _SHARED_CFG.get('OUTPUT_DIR', './outbox')))
+    ensure_dirs(_inbox_path)
+    ensure_dirs(_outbox_path)
+    # Initialize robot client+pool duy nhất
+    _robot_client = RobotClient(
+        ip=_SHARED_CFG.get('ROBOT_IP', '192.168.58.2'),
+        xmlrpc_port=int(_SHARED_CFG.get('XMLRPC_PORT', '20003')),
+        tcp_port=int(_SHARED_CFG.get('TCP_UPLOAD_PORT', '20010')),
+    )
+    _robot_client.connect()
+    print('arm_ready_combine')
 
-	robot = RobotClient(
-		ip=cfg.get('ROBOT_IP', '192.168.58.2'),
-		xmlrpc_port=int(cfg.get('XMLRPC_PORT', '20003')),
-		tcp_port=int(cfg.get('TCP_UPLOAD_PORT', '20010')),
-	)
-	if not robot.connect():
-		print('connect_failed')
-		sys.exit(1)
-	print('ready')
+@asynccontextmanager
+async def lifespan(app):
+    on_startup_sync()  # khởi tạo robot, pool, worker
+    threading.Thread(target=arm_worker_file_loop, daemon=True).start()
+    yield
+app.router.lifespan_context = lifespan
 
-	while True:
-		for name in sorted(os.listdir(in_dir)):
-			if not name.lower().endswith('.json'):
-				continue
-			full = os.path.join(in_dir, name)
-			print(f"[DEBUG] Processing file: {name}")
-			try:
-				with open(full, 'r', encoding='utf-8') as f:
-					cmd = json.load(f)
-				# remove input file immediately after reading to avoid double-processing
-				try:
-					os.remove(full)
-					print(f"[DEBUG] Removed input file: {full}")
-				except Exception as e:
-					print(f"[DEBUG] Failed to remove {full}: {e}")
-			except Exception:
-				# invalid JSON; remove to avoid repeated retries
-				resp = { 'ok': False, 'message': 'invalid_json' }
-				try:
-					os.remove(full)
-					print(f"[DEBUG] Removed invalid JSON file: {full}")
-				except Exception as e:
-					print(f"[DEBUG] Failed to remove invalid file {full}: {e}")
-			else:
-				resp = process_command(robot, cmd)
-			# write response
-			out_name = os.path.splitext(name)[0] + '.response.json'
-			with open(os.path.join(out_dir, out_name), 'w', encoding='utf-8') as f:
-				json.dump(resp, f, ensure_ascii=False)
-		# small sleep to avoid busy loop
-		time.sleep(0.2)
+# ========= BỔ SUNG/FIX: Đầy đủ endpoint từ server.py tích hợp luôn =========
+APP_ROOT = Path(__file__).resolve().parent
+LUA_DIR = APP_ROOT / "lua_scripts"
+DB_DIR = APP_ROOT / "TechPoint_db"
+ACTIVE_DB_NAME = "web_point.db"
+LUA_DIR.mkdir(parents=True, exist_ok=True)
+DB_DIR.mkdir(parents=True, exist_ok=True)
 
+def find_lua_executable() -> Optional[str]:
+    """Tìm kiếm file lua.exe trong các thư mục con của APP_ROOT."""
+    for root, dirs, files in os.walk(APP_ROOT):
+        for file in files:
+            if file.lower() == "lua.exe":
+                return os.path.join(root, file)
+    return None
 
-if __name__ == '__main__':
-	main()
+@app.post("/command")
+async def handle_command(action: str = Form(...), file: Optional[str] = Form(None)):
+    if action == "run_lua":
+        if not file:
+            raise HTTPException(status_code=400, detail="Missing 'file' for run_lua")
+        lua_path = (LUA_DIR / file).resolve()
+        if not str(lua_path).startswith(str(LUA_DIR.resolve())):
+            raise HTTPException(status_code=400, detail="Invalid file path")
+        if not lua_path.exists():
+            raise HTTPException(status_code=404, detail=f"Lua file not found: {file}")
+        lua_exe = find_lua_executable()
+        if not lua_exe:
+            return JSONResponse({
+                "status": "done",
+                "message": f"Arm completed {file} (simulated - no lua runtime)",
+            })
+        try:
+            result = subprocess.run(
+                [lua_exe, str(lua_path.name)],
+                cwd=str(LUA_DIR),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return JSONResponse({
+                "status": "done",
+                "message": f"Arm completed {file}",
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            })
+        except subprocess.CalledProcessError as e:
+            raise HTTPException(status_code=500, detail={
+                "error": "lua_execution_failed",
+                "returncode": e.returncode,
+                "stdout": e.stdout,
+                "stderr": e.stderr,
+            })
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
+
+@app.post("/robot/command")
+async def handle_robot_command(request: Request):
+    """
+    Nhận lệnh JSON và gửi đến robot để thực thi.
+    Đây là phiên bản HTTP của cơ chế file polling.
+    """
+    global _robot_client
+    if not _robot_client or not _robot_client.robot:
+        raise HTTPException(status_code=503, detail="Robot client not connected or initialized")
+    
+    try:
+        command_payload = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    # Tái sử dụng logic xử lý lệnh hiện có
+    result = process_command(_robot_client, command_payload)
+    
+    if result.get('ok'):
+        return JSONResponse(content=result, status_code=200)
+    else:
+        # Nếu lỗi là do input không hợp lệ, trả về 400
+        if result.get('message') in ['Missing file', 'Invalid path', 'Unknown command type', 'Missing path']:
+            return JSONResponse(content=result, status_code=400)
+        # Nếu lỗi là do robot thực thi thất bại, trả về 500
+        else:
+            return JSONResponse(content=result, status_code=500)
+
+@app.post("/upload/lua")
+async def upload_lua(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".lua"):
+        raise HTTPException(status_code=400, detail="Only .lua files are accepted")
+    dst = LUA_DIR / Path(file.filename).name
+    with open(dst, "wb") as f:
+        f.write(await file.read())
+    return {"status": "ok", "path": str(dst.relative_to(APP_ROOT))}
+
+@app.post("/upload/db")
+async def upload_db(
+    file: UploadFile = File(...),
+    activate: bool = Form(False),
+):
+    if not file.filename.lower().endswith(".db"):
+        raise HTTPException(status_code=400, detail="Only .db files are accepted")
+    dst = DB_DIR / Path(file.filename).name
+    with open(dst, "wb") as f:
+        f.write(await file.read())
+    active_path = DB_DIR / ACTIVE_DB_NAME
+    if activate:
+        temp_path = DB_DIR / (ACTIVE_DB_NAME + ".tmp")
+        shutil.copy2(dst, temp_path)
+        os.replace(temp_path, active_path)
+    return {
+        "status": "ok",
+        "stored": str(dst.relative_to(APP_ROOT)),
+        "active": str(active_path.relative_to(APP_ROOT)) if activate else None,
+    }
+
+# Thêm lại health endpoint nếu cần
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+def arm_worker_file_loop():
+    global _robot_client, _SHARED_CFG, _inbox_path, _outbox_path
+    while True:
+        if not (_robot_client and _SHARED_CFG and _inbox_path and _outbox_path):
+            time.sleep(0.2)
+            continue
+        for name in sorted(os.listdir(_inbox_path)):
+            if not name.lower().endswith('.json'):
+                continue
+            full = os.path.join(_inbox_path, name)
+            try:
+                with open(full, 'r', encoding='utf-8') as f:
+                    cmd = json.load(f)
+                # remove input file immediately after reading
+                try:
+                    os.remove(full)
+                except Exception:
+                    pass
+            except Exception:
+                resp = { 'ok': False, 'message': 'invalid_json' }
+            else:
+                resp = process_command(_robot_client, cmd)
+            out_name = os.path.splitext(name)[0] + '.response.json'
+            with open(os.path.join(_outbox_path, out_name), 'w', encoding='utf-8') as f:
+                json.dump(resp, f, ensure_ascii=False)
+        time.sleep(0.2)
+
+if __name__ == "__main__":
+    uvicorn.run("arm_controller:app", host="0.0.0.0", port=8001, reload=False)
