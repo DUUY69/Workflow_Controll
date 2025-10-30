@@ -19,3 +19,9 @@ New_code/IotController/outbox/
 IotController/inbox/
 IotController/outbox/
 
+# WorkFlowController runtime I/O
+New_code/WorkFlowController/inbox/
+New_code/WorkFlowController/outbox/
+WorkFlowController/inbox/
+WorkFlowController/outbox/
+

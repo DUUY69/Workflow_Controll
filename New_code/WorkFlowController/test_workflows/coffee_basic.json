@@ -1,0 +1,37 @@
+{
+  "id": "wf_coffee_1",
+  "name": "Coffee Basic: get ice, drop ice, arm home",
+  "steps": [
+    {
+      "id": "arm_move_to_ice",
+      "system": "arm",
+      "timeout": 20,
+      "request": {
+        "type": "run_lua",
+        "file": "MoveToMotor.lua"
+      }
+    },
+    {
+      "id": "ice_drop",
+      "system": "iot",
+      "timeout": 10,
+      "request": {
+        "command": "send_hex",
+        "device": "IceMake",
+        "hex": "04 07 AA 02 05 BC FF",
+        "flush": true,
+        "read_len": 16
+      }
+    },
+    {
+      "id": "arm_go_home",
+      "system": "arm",
+      "timeout": 20,
+      "request": {
+        "type": "run_lua",
+        "file": "MoveToMotor.lua"
+      }
+    }
+  ]
+}
+
