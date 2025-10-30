@@ -113,7 +113,7 @@ async def upload_lua(file: UploadFile = File(...)):
 	if not file.filename.lower().endswith(".lua"):
 		raise HTTPException(status_code=400, detail="Only .lua files are accepted")
 	
-dst = LUA_DIR / Path(file.filename).name
+	dst = LUA_DIR / Path(file.filename).name
 	with open(dst, "wb") as f:
 		f.write(await file.read())
 	return {"status": "ok", "path": str(dst.relative_to(APP_ROOT))}
@@ -121,28 +121,28 @@ dst = LUA_DIR / Path(file.filename).name
 
 @app.post("/upload/db")
 async def upload_db(
-	file: UploadFile = File(...),
-	activate: bool = Form(False),
+    file: UploadFile = File(...),
+    activate: bool = Form(False),
 ):
-	if not file.filename.lower().endswith(".db"):
-		raise HTTPException(status_code=400, detail="Only .db files are accepted")
+    if not file.filename.lower().endswith(".db"):
+        raise HTTPException(status_code=400, detail="Only .db files are accepted")
 
-	dst = DB_DIR / Path(file.filename).name
-	with open(dst, "wb") as f:
-		f.write(await file.read())
+    dst = DB_DIR / Path(file.filename).name
+    with open(dst, "wb") as f:
+        f.write(await file.read())
 
-	active_path = DB_DIR / ACTIVE_DB_NAME
-	if activate:
-		# Replace active DB atomically when possible
-		temp_path = DB_DIR / (ACTIVE_DB_NAME + ".tmp")
-		shutil.copy2(dst, temp_path)
-		os.replace(temp_path, active_path)
+    active_path = DB_DIR / ACTIVE_DB_NAME
+    if activate:
+        # Replace active DB atomically when possible
+        temp_path = DB_DIR / (ACTIVE_DB_NAME + ".tmp")
+        shutil.copy2(dst, temp_path)
+        os.replace(temp_path, active_path)
 
-	return {
-		"status": "ok",
-		"stored": str(dst.relative_to(APP_ROOT)),
-		"active": str(active_path.relative_to(APP_ROOT)) if activate else None,
-	}
+    return {
+        "status": "ok",
+        "stored": str(dst.relative_to(APP_ROOT)),
+        "active": str(active_path.relative_to(APP_ROOT)) if activate else None,
+    }
 
 
 @app.get("/health")

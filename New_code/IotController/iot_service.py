@@ -8,6 +8,56 @@ import binascii
 from serial.tools import list_ports  # type: ignore
 import serial  # type: ignore
 
+import threading
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+import uvicorn
+
+# BIẾN TOÀN CỤC DÙNG CHUNG CHO CẢ FILE VÀ HTTP:
+_SHARED_SERIAL_POOL = {}
+_SHARED_ENV = None
+_SHARED_DEVICES = None
+
+app = FastAPI(title="IoTController Combo")
+
+def on_startup_sync():
+    global _SHARED_SERIAL_POOL, _SHARED_ENV, _SHARED_DEVICES, _inbox_path, _outbox_path
+    base = os.path.dirname(__file__)
+    env_path = os.path.join(base, '.env_iot_config')
+    _SHARED_ENV = load_env_file(env_path)
+    _SHARED_ENV.setdefault('INPUT_DIR', './inbox')
+    _SHARED_ENV.setdefault('OUTPUT_DIR', './outbox')
+    _SHARED_ENV.setdefault('DEFAULT_BAUDRATE', '115200')
+    _SHARED_ENV.setdefault('DEFAULT_TIMEOUT', '1.0')
+    _SHARED_DEVICES = parse_devices_from_config_env(env_path)
+    _SHARED_SERIAL_POOL = {}
+    _inbox_path = os.path.abspath(os.path.join(base, _SHARED_ENV.get('INPUT_DIR', './inbox')))
+    _outbox_path = os.path.abspath(os.path.join(base, _SHARED_ENV.get('OUTPUT_DIR', './outbox')))
+    ensure_dirs(_inbox_path)
+    ensure_dirs(_outbox_path)
+    print('iot_ready_combine')
+
+@app.on_event("startup")
+def on_startup():
+    on_startup_sync()
+    threading.Thread(target=worker_file_loop, daemon=True).start()
+
+@app.post("/command_json")
+async def command_json(req: Request):
+    global _SHARED_SERIAL_POOL, _SHARED_ENV, _SHARED_DEVICES
+    try:
+        payload = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_json")
+    if not (_SHARED_ENV and _SHARED_DEVICES):
+        return JSONResponse({"ok": False, "message": "service_NOT_ready"})
+    resp = process_command(_SHARED_SERIAL_POOL, _SHARED_DEVICES, _SHARED_ENV, payload)
+    return JSONResponse(resp)
+
+@app.get("/health")
+async def health():
+    return {"status":"ok"}
+
 
 def load_env_file(path: str) -> Dict[str, str]:
     cfg: Dict[str, str] = {}
@@ -28,6 +78,7 @@ class IoTSerial:
 
     def open(self, port: str, baudrate: int = 115200, timeout: float = 1.0) -> bool:
         try:
+            print(f"[DEBUG] open port={port}, baudrate={baudrate}, timeout={timeout}")
             if self.ser and self.ser.is_open:
                 try:
                     self.ser.close()
@@ -36,7 +87,8 @@ class IoTSerial:
             self.ser = serial.Serial(port=port, baudrate=baudrate, timeout=timeout,
                                      bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE)
             return bool(self.ser and self.ser.is_open)
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] COM open failed: {e}")
             return False
 
     def is_open(self) -> bool:
@@ -225,38 +277,19 @@ def ensure_dirs(path: str) -> None:
         os.makedirs(path, exist_ok=True)
 
 
-def main() -> None:
-    base = os.path.dirname(__file__)
-    # Prefer dedicated IoT env, fallback to config.env
-    preferred_env = os.path.join(base, '.env_iot_config')
-    fallback_env = os.path.join(base, 'config.env')
-    env_path = preferred_env if os.path.exists(preferred_env) else fallback_env
-    env = load_env_file(env_path)
-    # Defaults
-    env.setdefault('INPUT_DIR', './inbox')
-    env.setdefault('OUTPUT_DIR', './outbox')
-    env.setdefault('DEFAULT_BAUDRATE', '115200')
-    env.setdefault('DEFAULT_TIMEOUT', '1.0')
-
-    in_dir = os.path.abspath(os.path.join(base, env.get('INPUT_DIR', './inbox')))
-    out_dir = os.path.abspath(os.path.join(base, env.get('OUTPUT_DIR', './outbox')))
-    ensure_dirs(in_dir)
-    ensure_dirs(out_dir)
-
-    devices = parse_devices_from_config_env(env_path)
-    # Multi-device connection pool: key by device name or port string
-    iot_pool: Dict[str, IoTSerial] = {}
-    print('iot_ready')
-
+def worker_file_loop():
+    global _SHARED_SERIAL_POOL, _SHARED_ENV, _SHARED_DEVICES, _inbox_path, _outbox_path
     while True:
-        for name in sorted(os.listdir(in_dir)):
+        if not (_SHARED_ENV and _SHARED_DEVICES and _inbox_path and _outbox_path):
+            time.sleep(0.2)
+            continue
+        for name in sorted(os.listdir(_inbox_path)):
             if not name.lower().endswith('.json'):
                 continue
-            full = os.path.join(in_dir, name)
+            full = os.path.join(_inbox_path, name)
             try:
                 with open(full, 'r', encoding='utf-8') as f:
                     cmd = json.load(f)
-                # remove file immediately after read
                 try:
                     os.remove(full)
                 except Exception:
@@ -264,14 +297,13 @@ def main() -> None:
             except Exception:
                 resp = { 'ok': False, 'message': 'invalid_json' }
             else:
-                resp = process_command(iot_pool, devices, env, cmd)
+                resp = process_command(_SHARED_SERIAL_POOL, _SHARED_DEVICES, _SHARED_ENV, cmd)
             out_name = os.path.splitext(name)[0] + '.response.json'
-            with open(os.path.join(out_dir, out_name), 'w', encoding='utf-8') as f:
+            with open(os.path.join(_outbox_path, out_name), 'w', encoding='utf-8') as f:
                 json.dump(resp, f, ensure_ascii=False)
         time.sleep(0.2)
 
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    uvicorn.run("iot_service:app", host="0.0.0.0", port=8002, reload=False)
 
 

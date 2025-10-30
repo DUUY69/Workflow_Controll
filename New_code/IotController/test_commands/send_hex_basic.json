@@ -1,5 +1,8 @@
 {
   "command": "send_hex",
-  "hex": "04 07 AA 02 05 BC FF"
+  "device": "IceMake",
+  "hex": "04 07 AA 02 05 BC FF",
+  "flush": true,
+  "read_len": 16
 }
 
