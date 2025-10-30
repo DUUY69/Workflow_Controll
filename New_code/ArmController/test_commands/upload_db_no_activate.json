@@ -1,0 +1,7 @@
+{
+  "id": "upload_points_db_no_activate",
+  "type": "upload_tech_point",
+  "path": "web_point_2.db",
+  "activate": false
+}
+

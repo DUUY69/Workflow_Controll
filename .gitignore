@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Env files
+.env*
+
+# VSCode/IDE
+.vscode/
+.idea/
+
+# IoTController runtime I/O
+New_code/IotController/inbox/
+New_code/IotController/outbox/
+IotController/inbox/
+IotController/outbox/
+

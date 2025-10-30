@@ -1,0 +1,7 @@
+{
+  "command": "send_hex",
+  "hex": "04 07 AA 02 05 BC FF",
+  "read_until": "FF",
+  "flush": true
+}
+

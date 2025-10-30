@@ -1,0 +1,6 @@
+{
+  "command": "connect",
+  "port": "COM19",
+  "baud": 115200
+}
+
