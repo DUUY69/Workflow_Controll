@@ -37,6 +37,68 @@ class RobotClient:
 		self.xmlrpc_port = xmlrpc_port
 		self.tcp_port = tcp_port
 		self.robot = None  # SDK RPC object or xmlrpc ServerProxy
+		# Mặc định gán chỉ số DO cho BUSY/DONE (có thể đổi qua cấu hình)
+		self.DO_BUSY_INDEX = 0
+		self.DO_DONE_INDEX = 1
+		# Cache method RPC thiếu để không gọi lặp
+		self._missing_rpc = set()
+		# Trace state thread controls
+		self._trace_thread = None
+		self._trace_stop = threading.Event()
+		self._trace_interval = 0.2
+
+	def _log_state_once(self):
+		"""Log one snapshot of state."""
+		# Try realtime first
+		ok, res = self._try_rpc('GetRobotRealTimeState')
+		if ok and isinstance(res, (tuple, list)) and len(res) >= 2:
+			try:
+				err, pkg = int(res[0]), res[1]
+				if err == 0 and pkg is not None:
+					md_val = int(getattr(pkg, 'motion_done', 0))
+					ql_val = int(getattr(pkg, 'mc_queue_len', -1))
+					prog = int(getattr(pkg, 'program_state', 0))
+					rbt = int(getattr(pkg, 'robot_state', 0))
+					print(f"[TRACE] RT motion_done={md_val} queue={ql_val} program_state={prog} robot_state={rbt}")
+					return
+			except Exception:
+				pass
+		# Fallback motion done + queue length
+		ok_md, res_md = self._try_rpc('GetRobotMotionDone')
+		ok_ql, res_ql = self._try_rpc('GetMotionQueueLength')
+		try:
+			md = int(res_md[1]) if (ok_md and isinstance(res_md, (tuple, list)) and len(res_md) >= 2) else (int(res_md) if ok_md else -1)
+			ql = int(res_ql[1]) if (ok_ql and isinstance(res_ql, (tuple, list)) and len(res_ql) >= 2) else (int(res_ql) if ok_ql else -1)
+			print(f"[TRACE] MDQL motion_done={md} queue={ql}")
+		except Exception as e:
+			print(f"[TRACE] state error: {e}")
+
+	def start_trace_state(self, interval_ms: int = 200):
+		"""Start continuous state tracing logs."""
+		self._trace_interval = max(10, int(interval_ms)) / 1000.0
+		self.stop_trace_state()
+		self._trace_stop.clear()
+		def _runner():
+			print(f"[TRACE] start state tracing every {self._trace_interval:.3f}s")
+			while not self._trace_stop.is_set():
+				self._log_state_once()
+				time.sleep(self._trace_interval)
+			print("[TRACE] stop state tracing")
+		self._trace_thread = threading.Thread(target=_runner, daemon=True)
+		self._trace_thread.start()
+
+	def stop_trace_state(self):
+		"""Stop state tracing if running."""
+		try:
+			self._trace_stop.set()
+			if self._trace_thread and self._trace_thread.is_alive():
+				self._trace_thread.join(timeout=0.1)
+		except Exception:
+			pass
+		finally:
+			self._trace_thread = None
+		# Cache các RPC thiếu để không gọi lặp lại gây spam
+		self._missing_rpc = set()
 
 	def connect(self):
 		print(f"[LOG] Bắt đầu kết nối tới robot tại IP {self.ip} (SDK/XMLRPC Port: {self.xmlrpc_port})")
@@ -80,6 +142,94 @@ class RobotClient:
 			return func(*args)
 		raise AttributeError(name)
 
+	def _try_rpc(self, name: str, *args):
+		"""Gọi RPC an toàn, nếu thiếu (-506) thì ghi nhớ để lần sau bỏ qua."""
+		if name in self._missing_rpc:
+			return False, None
+		try:
+			res = self._call(name, *args)
+			return True, res
+		except Exception as e:
+			# Nếu lỗi -506 (method not defined), đánh dấu missing
+			if "-506" in str(e) or "not defined" in str(e):
+				self._missing_rpc.add(name)
+			return False, e
+
+	def set_do(self, index: int, value: int) -> bool:
+		"""Set DO tại controller (không phải tool) nếu SDK hỗ trợ."""
+		try:
+			fn = getattr(self.robot, 'SetDO', None)
+			if not callable(fn):
+				return False
+			res = fn(int(index), int(value), 0, 0)
+			# nhiều API trả 0 khi thành công
+			return (int(res[0]) == 0) if isinstance(res, (tuple, list)) else (int(res) == 0)
+		except Exception:
+			return False
+
+	def get_do_state(self) -> dict:
+		"""Đọc DO của controller, trả về dict gồm bitmask high/low và cờ busy/done."""
+		result = {
+			'ok': False,
+			'do_state_h': None,
+			'do_state_l': None,
+			'busy': None,
+			'done': None,
+			'busy_index': self.DO_BUSY_INDEX,
+			'done_index': self.DO_DONE_INDEX,
+		}
+		try:
+			fn = getattr(self.robot, 'GetDO', None)
+			if not callable(fn):
+				return result
+			res = fn()
+			# theo SDK: (err, do_state_h, do_state_l)
+			if isinstance(res, (tuple, list)) and len(res) >= 3:
+				err = int(res[0])
+				do_h = int(res[1])
+				do_l = int(res[2])
+				if err == 0:
+					busy_bit = (do_l >> int(self.DO_BUSY_INDEX)) & 1 if self.DO_BUSY_INDEX < 8 else (do_h >> (self.DO_BUSY_INDEX - 8)) & 1
+					done_bit = (do_l >> int(self.DO_DONE_INDEX)) & 1 if self.DO_DONE_INDEX < 8 else (do_h >> (self.DO_DONE_INDEX - 8)) & 1
+					result.update({
+						'ok': True,
+						'do_state_h': do_h,
+						'do_state_l': do_l,
+						'busy': bool(busy_bit),
+						'done': bool(done_bit),
+					})
+			return result
+		except Exception:
+			return result
+
+	def wait_done_via_do(self, timeout_s: float = 30.0, poll_ms: int = 200, require_busy_first: bool = False) -> dict:
+		"""Chờ đến khi DONE (done==1 và busy==0) dựa trên DO. Trả {ok, reason}."""
+		# Nếu không đọc được DO ngay từ đầu -> báo lỗi nhanh để caller bỏ qua cơ chế này
+		initial = self.get_do_state()
+		if not initial.get('ok'):
+			return { 'ok': False, 'reason': 'no_getdo', 'state': initial }
+		start = time.time()
+		seen_busy = False
+		while True:
+			state = self.get_do_state()
+			if state.get('ok'):
+				busy = bool(state.get('busy'))
+				done = bool(state.get('done'))
+				if require_busy_first:
+					if busy:
+						seen_busy = True
+					# Chỉ kết thúc khi đã từng busy và hiện done && !busy
+					if seen_busy and done and not busy:
+						return { 'ok': True, 'reason': 'done_via_do', 'state': state }
+				else:
+					# Không yêu cầu bối cảnh busy
+					if done and not busy:
+						return { 'ok': True, 'reason': 'done_via_do', 'state': state }
+			# timeout
+			if timeout_s > 0 and (time.time() - start) > timeout_s:
+				return { 'ok': False, 'reason': 'timeout', 'state': state }
+			time.sleep(max(0.01, float(poll_ms) / 100.0 / 10.0))
+
 	def run_lua_and_wait(self, lua_filename: str, timeout: float = 0) -> bool:
 		if self.robot is None:
 			print(f"[DEBUG] Robot is None")
@@ -97,6 +247,11 @@ class RobotClient:
 			if int(run_result) != 0:
 				print(f"[DEBUG] ProgramRun failed: {run_result}")
 				return False
+			# Pre-wait ngắn để tránh đọc nhầm frame idle ngay sau khi run
+			try:
+				self._prewait_enter_motion(max_wait_s=0.5)
+			except Exception:
+				pass
 			print(f"[DEBUG] Starting wait for completion...")
 			return self._wait_complete(timeout)
 		except Exception as e:
@@ -106,77 +261,123 @@ class RobotClient:
 	def _wait_complete(self, timeout: float) -> bool:
 		start = time.time()
 		wait_forever = timeout <= 0
+		last_missing_log_ts = 0.0
+		seen_busy = False  # Chỉ cho phép hoàn thành sau khi đã từng thấy trạng thái bận
+
+		# Pre-detect capability once (best-effort)
+		try:
+			get_rt = getattr(self.robot, 'GetRobotRealTimeState', None)
+			get_md = getattr(self.robot, 'GetRobotMotionDone', None)
+			get_ql = getattr(self.robot, 'GetMotionQueueLength', None)
+			get_cf = getattr(self.robot, 'CheckCommandFinish', None)
+			get_ms = getattr(self.robot, 'GetRobotMotionState', None)
+			get_ps = getattr(self.robot, 'GetProgramState', None)
+			detectors = [fn for fn in (get_rt, get_md and get_ql, get_cf, get_ms, get_ps) if callable(fn) or fn is not None]
+			has_any_detector = len(detectors) > 0
+		except Exception:
+			has_any_detector = True  # be conservative
+
+		# Nếu không có detector mà yêu cầu chờ vô hạn, vẫn chờ (không auto success)
 
 		while True:
-			# Check for timeout only if it's not an indefinite wait
+			# Timeout: nếu có timeout hữu hạn thì coi là không hoàn thành
 			if not wait_forever and (time.time() - start > timeout):
-				print(f"[DEBUG] Timeout after {timeout}s, treating as completed")
-				return True  # Keep original behavior: timeout is considered success
+				print(f"[DEBUG] Timeout after {timeout}s, not completed")
+				return False
 
 			try:
-				# Method 1: CheckCommandFinish
-				if callable(getattr(self.robot, 'CheckCommandFinish', None)):
-					try:
-						result = self._call('CheckCommandFinish')
-						if isinstance(result, tuple):
-							err, finished = result
-							if err == 0 and finished:
-								print(f"[DEBUG] CheckCommandFinish: completed")
+				# Method 0: Realtime state polling (motion_done && mc_queue_len == 0)
+				# Prefer SDK realtime if available
+				if callable(get_rt):
+					ok, res = self._try_rpc('GetRobotRealTimeState')
+					if ok and isinstance(res, (tuple, list)) and len(res) >= 2:
+						err, pkg = res[0], res[1]
+						if int(err) == 0 and pkg is not None:
+							md_val = int(getattr(pkg, 'motion_done', 0))
+							ql_val = int(getattr(pkg, 'mc_queue_len', 1))
+							print(f"[DEBUG] RTState motion_done={md_val}, mc_queue_len={ql_val}")
+							# Đánh dấu đã bận khi md==0 hoặc queue>0
+							if (md_val == 0) or (ql_val > 0):
+								seen_busy = True
+							# Chỉ coi là hoàn thành khi đã từng bận và nay md==1 && queue==0
+							if seen_busy and md_val == 1 and ql_val == 0:
+								print(f"[DEBUG] Realtime state indicates completed")
 								return True
-						elif result:
-							print(f"[DEBUG] CheckCommandFinish: completed")
-							return True
-					except Exception as e:
-						print(f"[DEBUG] CheckCommandFinish error: {e}")
-				
-				# Method 2: GetRobotMotionState
-				if callable(getattr(self.robot, 'GetRobotMotionState', None)):
-					try:
-						result = self._call('GetRobotMotionState')
-						print(f"[DEBUG] Motion State: {result}")
-						if int(result) == 0:
-							print(f"[DEBUG] GetRobotMotionState: completed")
-							return True
-					except Exception as e:
-						print(f"[DEBUG] GetRobotMotionState error: {e}")
-				
-				# Method 3: GetProgramState (FIXED for list responses)
-				if callable(getattr(self.robot, 'GetProgramState', None)):
-					try:
-						res = self._call('GetProgramState')
-						# Handle both tuple and list for completion state [0, 0]
-						if isinstance(res, (tuple, list)):
-							if len(res) >= 2 and int(res[0]) == 0 and int(res[1]) == 0:
-								print(f"[DEBUG] GetProgramState: completed")
-								return True
-						# Handle single integer value for completion state 0
-						elif int(res) == 0:
-							print(f"[DEBUG] GetProgramState: completed")
-							return True
-					except Exception as e:
-						print(f"[DEBUG] GetProgramState error: {e}")
 
-				# Alternative names for program state check
-				for alt in ('ProgramState', 'GetProgramRunState', 'IsProgramRunning'):
-					try:
-						fn = getattr(self.robot, alt, None)
-						if callable(fn):
-							val = fn()
-							if isinstance(val, (tuple, list)):
-								err = int(val[0])
-								state = int(val[1]) if len(val) > 1 and val[1] is not None else 0
-								if err == 0 and state == 0:
-									print(f"[DEBUG] {alt}: completed")
-									return True
-							elif val in (0, False, None):
-								print(f"[DEBUG] {alt}: completed")
-								return True
-					except Exception:
-						pass
+				# Fallback: explicit motion done + queue length API
+				if callable(get_md) and callable(get_ql):
+					ok_md, res_md = self._try_rpc('GetRobotMotionDone')
+					ok_ql, res_ql = self._try_rpc('GetMotionQueueLength')
+					if ok_md and ok_ql:
+						# expect (err, val)
+						md_err, md_val = (int(res_md[0]), int(res_md[1])) if isinstance(res_md, (tuple, list)) and len(res_md) >= 2 else (0, int(res_md))
+						ql_err, ql_val = (int(res_ql[0]), int(res_ql[1])) if isinstance(res_ql, (tuple, list)) and len(res_ql) >= 2 else (0, int(res_ql))
+						md_ok = (int(md_err) == 0 and int(md_val) == 1) or (md_val in (1, True))
+						ql_ok = (int(ql_err) == 0 and int(ql_val) == 0) or (ql_val in (0, False))
+						print(f"[DEBUG] MotionDone={md_val} (err={md_err}), QueueLen={ql_val} (err={ql_err})")
+						# Đánh dấu đã bận khi md==0 hoặc queue>0
+						if (int(md_val) == 0) or (int(ql_val) > 0):
+							seen_busy = True
+						# Chỉ coi là hoàn thành khi đã từng bận và nay md==1 && queue==0
+						if seen_busy and md_ok and ql_ok:
+							print(f"[DEBUG] MotionDone+QueueLen: completed")
+							return True
+
+				# Bỏ các method phụ (ProgramState, CheckCommandFinish, ...), chỉ dựa vào RT/motion_done+queue
 			except Exception as e:
 				print(f"[DEBUG] Error in waiting loop: {e}")
 			
 			time.sleep(0.1)
+
+	def _prewait_enter_motion(self, max_wait_s: float = 0.5) -> None:
+		"""Đợi rất ngắn cho tới khi robot thật sự vào trạng thái bận để tránh snapshot idle.
+		Điều kiện coi là đã bận: motion_done==0 hoặc mc_queue_len>0 hoặc program_state==2 hoặc robot_state==2.
+		"""
+		deadline = time.time() + max(0.0, float(max_wait_s))
+		get_rt = getattr(self.robot, 'GetRobotRealTimeState', None)
+		get_md = getattr(self.robot, 'GetRobotMotionDone', None)
+		get_ql = getattr(self.robot, 'GetMotionQueueLength', None)
+		get_ps = getattr(self.robot, 'GetProgramState', None)
+		get_ms = getattr(self.robot, 'GetRobotMotionState', None)
+		while time.time() < deadline:
+			# Try realtime first
+			try:
+				if callable(get_rt):
+					ok, res = self._try_rpc('GetRobotRealTimeState')
+					if ok and isinstance(res, (tuple, list)) and len(res) >= 2:
+						err, pkg = res[0], res[1]
+						if int(err) == 0 and pkg is not None:
+							md_val = int(getattr(pkg, 'motion_done', 1))
+							ql_val = int(getattr(pkg, 'mc_queue_len', 0))
+							prog = int(getattr(pkg, 'program_state', 0))
+							rbt = int(getattr(pkg, 'robot_state', 0))
+							if md_val == 0 or ql_val > 0 or prog == 2 or rbt == 2:
+								return
+				# Fallback MD/QL
+				if callable(get_md) and callable(get_ql):
+					ok_md, res_md = self._try_rpc('GetRobotMotionDone')
+					ok_ql, res_ql = self._try_rpc('GetMotionQueueLength')
+					if ok_md and ok_ql:
+						md_val = int(res_md[1]) if (isinstance(res_md, (tuple, list)) and len(res_md) >= 2) else int(res_md)
+						ql_val = int(res_ql[1]) if (isinstance(res_ql, (tuple, list)) and len(res_ql) >= 2) else int(res_ql)
+						if md_val == 0 or ql_val > 0:
+							return
+				# Fallback Program/Motion state if available
+				if callable(get_ps):
+					ok_ps, res_ps = self._try_rpc('GetProgramState')
+					if ok_ps:
+						ps_val = int(res_ps[1]) if (isinstance(res_ps, (tuple, list)) and len(res_ps) >= 2) else int(res_ps)
+						if ps_val == 2:
+							return
+				if callable(get_ms):
+					ok_ms, res_ms = self._try_rpc('GetRobotMotionState')
+					if ok_ms:
+						ms_val = int(res_ms[1]) if (isinstance(res_ms, (tuple, list)) and len(res_ms) >= 2) else int(res_ms)
+						if ms_val == 2:
+							return
+			except Exception:
+				pass
+			time.sleep(0.05)
 
 	def upload_lua(self, path: str) -> bool:
 		if self.robot is None:
@@ -429,10 +630,22 @@ def process_command(robot: RobotClient, cmd: Dict[str, Any]) -> Dict[str, Any]:
 	if type_ == 'run_lua':
 		file_ = cmd.get('file')
 		timeout = float(cmd.get('timeout', 0))  # Default to 0 (wait forever)
+		# Luôn chờ đến khi dừng hẳn: bỏ các tuỳ chọn, cưỡng bức blocking
 		if not file_:
 			result['message'] = 'Missing file'
 			return result
-		ok = robot.run_lua_and_wait(file_, timeout)
+		# Luôn đợi tới khi dừng thật sự
+		# 1) Đợi theo realtime/motion_done + queue (vô hạn)
+		ok = robot.run_lua_and_wait(file_, 0)
+		# 2) Dùng DO như xác nhận phụ (nếu khả dụng). Không bắt buộc DO.
+		probe = robot.get_do_state()
+		if ok and probe.get('ok'):
+			do_wait = robot.wait_done_via_do(timeout_s=0, poll_ms=200, require_busy_first=True)
+			ok = ok and bool(do_wait.get('ok'))
+			result['do_wait'] = do_wait
+		elif ok and not probe.get('ok'):
+			# Ghi chú để biết DO không khả dụng, nhưng vẫn dựa realtime
+			result['do_wait'] = { 'ok': False, 'reason': 'no_getdo', 'state': probe }
 		result['ok'] = bool(ok)
 		result['message'] = 'completed' if ok else 'failed'
 		return result
@@ -589,6 +802,61 @@ async def handle_robot_command(request: Request):
         # Nếu lỗi là do robot thực thi thất bại, trả về 500
         else:
             return JSONResponse(content=result, status_code=500)
+
+@app.get("/robot/do_state")
+async def get_robot_do_state():
+    """Trả trạng thái DO (bitmask high/low) và cờ busy/done theo chỉ số mặc định."""
+    global _robot_client
+    if not _robot_client or not _robot_client.robot:
+        raise HTTPException(status_code=503, detail="Robot client not connected or initialized")
+    state = _robot_client.get_do_state()
+    if not state.get('ok'):
+        return JSONResponse(content=state, status_code=500)
+    return JSONResponse(content=state, status_code=200)
+
+@app.post("/robot/wait_done")
+async def wait_done_via_do(
+    request: Request,
+):
+    """Block cho tới khi DONE qua DO (done==1 và busy==0), có timeout.
+    JSON body (tuỳ chọn): { "timeout": 30.0, "poll_ms": 200, "require_busy_first": false }
+    """
+    global _robot_client
+    if not _robot_client or not _robot_client.robot:
+        raise HTTPException(status_code=503, detail="Robot client not connected or initialized")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    timeout = float(body.get('timeout', 30.0))
+    poll_ms = int(body.get('poll_ms', 200))
+    require_busy_first = bool(body.get('require_busy_first', False))
+    result = _robot_client.wait_done_via_do(timeout_s=timeout, poll_ms=poll_ms, require_busy_first=require_busy_first)
+    status = 200 if result.get('ok') else 408
+    return JSONResponse(content=result, status_code=status)
+
+@app.post("/robot/trace_state/start")
+async def start_trace_state(request: Request):
+    """Bật in log trạng thái liên tục (console). Body: { "interval_ms": 200 }"""
+    global _robot_client
+    if not _robot_client or not _robot_client.robot:
+        raise HTTPException(status_code=503, detail="Robot client not connected or initialized")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    interval_ms = int(body.get('interval_ms', 200))
+    _robot_client.start_trace_state(interval_ms=interval_ms)
+    return {"ok": True, "interval_ms": interval_ms}
+
+@app.post("/robot/trace_state/stop")
+async def stop_trace_state():
+    """Tắt log trạng thái liên tục."""
+    global _robot_client
+    if not _robot_client:
+        return {"ok": True}
+    _robot_client.stop_trace_state()
+    return {"ok": True}
 
 @app.post("/upload/lua")
 async def upload_lua(file: UploadFile = File(...)):
