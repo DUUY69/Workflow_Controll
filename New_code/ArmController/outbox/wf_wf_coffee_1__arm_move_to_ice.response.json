@@ -1,0 +1,1 @@
+{"id": "wf_coffee_1:arm_move_to_ice", "ok": true, "do_wait": {"ok": false, "reason": "no_getdo", "state": {"ok": false, "do_state_h": null, "do_state_l": null, "busy": null, "done": null, "busy_index": 0, "done_index": 1}}, "message": "completed"}

@@ -85,23 +85,43 @@ def dispatch_step(env: Dict[str, str], wf_id: str, step: Dict[str, Any]) -> Dict
     else:
         return { 'ok': False, 'message': f'unknown_system:{system}' }
 
+    # Log step begin
+    try:
+        print(f"[WF] Step start wf={wf_id} step={step_id} system={system} timeout={timeout_s}s request={json.dumps(request, ensure_ascii=False)}")
+    except Exception:
+        print(f"[WF] Step start wf={wf_id} step={step_id} system={system} timeout={timeout_s}s (request log failed)")
+
     # Prefer HTTP if enabled and URL present
     if use_http and http_url:
-        # Choose endpoint
-        url = http_url.rstrip('/') + '/command_json'
+        # Choose endpoint per system
+        if system == 'arm':
+            url = http_url.rstrip('/') + '/robot/command'
+        else:
+            url = http_url.rstrip('/') + '/command_json'
+        print(f"[WF] Step {step_id} via HTTP: POST {url}")
         resp = _http_post_json(url, request, timeout_s)
         if resp is None:
             # fallback to file
-            pass
+            print(f"[WF] Step {step_id} HTTP failed/timeout -> fallback file pipeline")
         else:
+            try:
+                print(f"[WF] Step {step_id} HTTP response: {json.dumps(resp, ensure_ascii=False)}")
+            except Exception:
+                print(f"[WF] Step {step_id} HTTP response (log failed)")
             return resp
 
     base_name = f"wf_{wf_id}__{step_id}"
     in_path = os.path.join(inbox, base_name + '.json')
     write_json(in_path, request)
+    print(f"[WF] Step {step_id} file dispatch -> {in_path}")
     resp = wait_for_response(outbox, base_name, timeout_s)
     if not resp:
+        print(f"[WF] Step {step_id} file response: timeout after {timeout_s}s")
         return { 'ok': False, 'message': 'timeout' }
+    try:
+        print(f"[WF] Step {step_id} file response: {json.dumps(resp, ensure_ascii=False)}")
+    except Exception:
+        print(f"[WF] Step {step_id} file response (log failed)")
     return resp
 
 
@@ -111,11 +131,16 @@ def run_workflow(env: Dict[str, str], wf: Dict[str, Any]) -> Dict[str, Any]:
     steps: List[Dict[str, Any]] = list(wf.get('steps') or [])
     results: List[Dict[str, Any]] = []
 
+    print(f"[WF] Run workflow start id={wf_id} name={name} steps={len(steps)}")
+
     for idx, step in enumerate(steps, start=1):
+        step_name = str(step.get('id') or idx)
         resp = dispatch_step(env, wf_id, step)
-        results.append({ 'step': step.get('id') or idx, 'response': resp })
+        results.append({ 'step': step_name, 'response': resp })
         if not resp.get('ok'):
+            print(f"[WF] Workflow failed at step={step_name} (index={idx}) resp={resp}")
             return { 'id': wf_id, 'name': name, 'ok': False, 'failed_at': idx, 'results': results }
+    print(f"[WF] Workflow success id={wf_id} name={name}")
     return { 'id': wf_id, 'name': name, 'ok': True, 'results': results }
 
 
@@ -150,6 +175,7 @@ def main() -> None:
             full = os.path.join(in_dir, name)
             try:
                 wf = read_json(full)
+                print(f"[WF] Received workflow file: {full}")
                 try:
                     os.remove(full)
                 except Exception:
